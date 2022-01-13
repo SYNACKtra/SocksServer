@@ -58,7 +58,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Collections.ObjectModel;
 
-namespace MS
+namespace Mono
 {
 	public abstract class BufferManager
 	{
