@@ -176,8 +176,11 @@ namespace Mono
 			
 			public override byte [] TakeBuffer (int bufferSize)
 			{
-				if (bufferSize < 0 || (max_size >= 0 && bufferSize > max_size)) {
-					throw new ArgumentOutOfRangeException ();
+				if(bufferSize < 0) {
+					bufferSize = max_size;
+				}
+				if (max_size >= 0 && bufferSize > max_size) {
+					throw new Exception("NotYetImplemented");
 				}
 
 				int l2 = log2 ((uint) bufferSize);

@@ -2,11 +2,25 @@
 using System;
 using System.Globalization;
 using System.Net;
+using System.Threading;
  
 namespace SocksServer
 {
     class Program
     {
+        private static long m_StartTime;
+        public static long StartTime
+        {
+            get
+            {
+                return m_StartTime;
+            }
+            set
+            {
+                m_StartTime = value;
+            }
+        }
+
         public static IPEndPoint CreateIPEndPoint()
         {
             IPAddress ip;
@@ -20,7 +34,13 @@ namespace SocksServer
 
         static void Main()
         {
-            Server server = new Server (100, 255);
+            DateTime start = DateTime.Now;
+            long unixTime = ((DateTimeOffset)start).ToUnixTimeMilliseconds();
+            m_StartTime = unixTime;
+            Thread.Sleep(29);
+            Console.WriteLine(new avg(2^5, 0));
+
+            Server server = new Server (100, 512);
             server.Init();
             server.Start(CreateIPEndPoint());
         }

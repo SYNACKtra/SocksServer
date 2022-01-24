@@ -99,7 +99,7 @@ namespace MS {
     using Fx;
 
     using Mono;
-
+    using SocksServer;
 
 	// If we ever implement more interfaces on IReadOnlyCollection, we should also update RuntimeTypeCache.PopulateInterfaces() in rttype.cs
 	
