@@ -186,6 +186,9 @@ namespace SocksServer
                     //The maximum length of a DNS name is 255 octets. This is spelled out in RFC 1035 section 2.3.4. A customer didn’t understand why the DnsValidateName was rejecting the following string: Is longer than 255 octets. Contains a label longer than 63 octets.
                         bufferSize = 5 + 255;
                         break;
+                    case 4:
+                        bufferSize = 22;//TODO: config
+                        break;
                     default:
                         bufferSize = 256;
                         break;
@@ -310,36 +313,37 @@ namespace SocksServer
         | 1  |  1  | X'00' |  1   | Variable |    2     |
         +----+-----+-------+------+----------+----------+
                 */
+                Console.WriteLine();
+                SocketAddress address = ((IPEndPoint)m_outbound.LocalEndPoint).Serialize();
+                byte[] buffer, portBytes;
+                portBytes = BitConverter.GetBytes((short)((IPEndPoint)m_outbound.LocalEndPoint).Port);
 
-                Console.WriteLine(m_outbound.LocalEndPoint);
-                SocketAddress address = m_outbound.LocalEndPoint.Serialize();
-
-                byte[] remoteAddrBytes = new byte[address.Size];
                 switch(m_outbound.LocalEndPoint.AddressFamily) {
                     case AddressFamily.InterNetworkV6:
-                        byte[] buffer = new byte[] {0x05, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-                        for (int i = 0; i < address.Size; i++) {
-                            buffer[i + 4] = address[i];
+                        buffer = new byte[22] {0x05, 0, 0, 0x04, address[4], address[5], address[6], address[7], address[8], address[9], address[10], address[11], address[12], address[13], address[14], address[15], address[16], address[17], address[18], address[19], address[20], address[3]};
+                        for (int i = 0; i < 16; i++) {
+                            buffer[22 - 2 - i] = address[i];
                         }
-                        
+                        buffer[22 - 1] = portBytes[1];
+                        buffer[22 - 2] = portBytes[0];
                         this.eArgs[4].SetBuffer(buffer, 0, 22);
                         break;
-                    default:
-                        byte[] buffer = new byte[] {0x05, 0, 0, 0x01, 0, 0, 0, 0, 0, 0};
-                        for (int i = 0; i < address.Size; i++) {
-                            buffer[i + 4] = address[i];
-                        }
+                    case AddressFamily.InterNetwork:
+                        buffer = new byte[] {0x05, 0, 0, 0x01, address[4], address[5], address[6], address[7], address[4], address[3]};
                         this.eArgs[4].SetBuffer(buffer, 0, 10);
                         break;
+                    default:
+                        throw new Exception("Protocol not implemented");
                 }
 
                 if(!this.l_socket.SendAsync(this.eArgs[4]))
                 {
                     this.m_ClientState = ClientState.RemoteConnected;
-                    eLoop(sender, e);
+                    eLoop(sender, this.eArgs[4]);
+                    return;
                 }
+
                 Console.WriteLine("Client has connected to " + requestAddress);
-                return;
             }
 
             if(this.m_ClientState == ClientState.RemoteConnecting)
@@ -403,6 +407,22 @@ namespace SocksServer
             if(clientUntoten || this.eArgs == null)
             {
                 return;
+            }
+
+            if(!this.l_socket.SendAsync(this.eArgs[4]))
+            {
+                eLoop(sender, e);
+                return;
+            } else {
+                this.m_ClientState = ClientState.RemoteConnected;
+            }
+
+            if(!this.l_socket.SendAsync(this.eArgs[4]))
+            {
+                eLoop(sender, e);
+                return;
+            } else {
+                this.m_ClientState = ClientState.RemoteConnected;
             }
 
             if(m_ClientState == ClientState.RemoteConnected && e.SocketError == SocketError.Success)
