@@ -19,7 +19,7 @@ namespace SocksServer
         Connecting,
         RemoteConnecting,
         RemoteConnected,
-        RemoteConnected_Notify
+        RemoteConnecting_Notify
     }
 
     public class ActiveClient
@@ -86,8 +86,8 @@ namespace SocksServer
         SocketAsyncEventArgs m_read;
         SocketAsyncEventArgs l_remoteRead;
         SocketAsyncEventArgs l_remoteConnect;
-        Server l_server;
-        Socket l_socket;
+        Server m_server;
+        Socket m_socket;
         Socket m_outbound;
         int l_totalBytesRead;
         public ClientState m_ClientState = ClientState.NotConnected;
@@ -97,7 +97,12 @@ namespace SocksServer
         bool[] methods = new bool[255];
         bool m_ackSent = false;
         bool requestGiven = false;
-        static short BUFFER_SIZE = 4;
+        static short BUFFER_SIZE = 16;
+        static short MAX_DNS_SIZE = 255;  //The maximum length of a DNS name is 255 octets. This is spelled out in RFC 1035 section 2.3.4. A customer didn’t understand why the DnsValidateName was rejecting the following string: Is longer than 255 octets. Contains a label longer than 63 octets.
+        static short MAX_METHODS = 255;
+        static int INDEX = 0;
+        static int SOCKS5_SOCK_ARGS_COUNT = 5;
+        int m_index;
 
         byte? requestSocksVersion = null;
         int? requestCommand = null;
@@ -112,51 +117,49 @@ namespace SocksServer
         short requestPort = -1;
         bool clientUntoten = false;
 
+        CancellationTokenSource startForwardingTokenDestination;
+        bool dstTokenRegistered = false;
+        CancellationTokenSource sourceOfHappiness;
+
         public EventHandler<SocketAsyncEventArgs> Loop;
-        public EventHandler<SocketAsyncEventArgs> Loop2;
+        public EventHandler<SocketAsyncEventArgs> m_InboundReceive;
+        public EventHandler<SocketAsyncEventArgs> m_OutboundReceive;
 
         public SocketAsyncEventArgs[] eArgs;
 
-        byte[] rcvBuf;
+        bool evenFresherConnectSkip = false;
 
         public Socket Socket
         {
             get {
-                return l_socket;
+                return m_socket;
             }
         }
 
         public ActiveClient(Server server)
         {
             Console.WriteLine("Creating client");
-        	l_server = server;
-            //l_socket = socket;
+        	m_server = server;
+            //m_socket = socket;
             Loop = new EventHandler<SocketAsyncEventArgs>(eLoop);
+            m_InboundReceive = new EventHandler<SocketAsyncEventArgs>(InboundReceive);
+            m_OutboundReceive = new EventHandler<SocketAsyncEventArgs>(OutboundReceive);
 
             this.eArgs = new SocketAsyncEventArgs[Server.SOCK_ARGS_COUNT];
+
+            m_index = INDEX++;
         }
 
         public void SetSocket(Socket lSocket)
         {
-            l_socket = lSocket;
-        }
-
-        public void Initialize(SocketAsyncEventArgs accept)
-        {
-            Console.WriteLine("Accept");
-            this.l_socket = accept.AcceptSocket;
-            this.m_ClientState = ClientState.TCP_SYNACK;
-            //m_read.RemoteEndPoint = endPoint;
-            //this.m_read.Completed += this.AcceptHandler;
-            //this.m_read.LocalEndPoint = e.LocalEndPoint;
-            // this.l_server.m_readWritePool.SetupBuffer(this.m_read, false);
+            m_socket = lSocket;
         }
 
         public void AllocPool()
         {
-            for (int y = 0; y < Server.SOCK_ARGS_COUNT; y++)
+            for (int y = 0; y < ActiveClient.SOCKS5_SOCK_ARGS_COUNT; y++)
             {
-                SocketAsyncEventArgs eventArgs = new SocketAsyncEventArgs();
+                SocketAsyncEventArgs eventArgs = this.m_server.m_readWritePool.Take();
                 eventArgs.UserToken = this;
                 eventArgs.Completed += this.Loop;
 
@@ -170,7 +173,7 @@ namespace SocksServer
                    +----+----------+----------+ */
 
                     case 0:
-                        bufferSize = 2 + 255;
+                        bufferSize = 2 + MAX_METHODS;
                         break;
                     case 1:
                     /*
@@ -183,19 +186,24 @@ namespace SocksServer
                         bufferSize = -1;
                         break;
                     case 2:
-                    //The maximum length of a DNS name is 255 octets. This is spelled out in RFC 1035 section 2.3.4. A customer didn’t understand why the DnsValidateName was rejecting the following string: Is longer than 255 octets. Contains a label longer than 63 octets.
-                        bufferSize = 5 + 255;
+                        bufferSize = 5 + MAX_DNS_SIZE;
                         break;
                     case 4:
-                        bufferSize = 22;//TODO: config
+                        bufferSize = 6 + MAX_DNS_SIZE;//TODO: config
+                        break;
+                    case 7:
+                        bufferSize = BUFFER_SIZE;
+                        break;
+                    case 8:
+                        bufferSize = BUFFER_SIZE;
                         break;
                     default:
-                        bufferSize = 256;
+                        bufferSize = 512;
                         break;
                 }
 
                 if(bufferSize > -1) {
-                    eventArgs.SetBuffer(this.l_server.m_bufferManager.TakeBuffer(bufferSize), 0, bufferSize);
+                    eventArgs.SetBuffer(this.m_server.m_bufferManager.TakeBuffer(bufferSize), 0, bufferSize);
                 }
 
                 this.eArgs[y] = eventArgs;
@@ -203,15 +211,16 @@ namespace SocksServer
             }
         }
 
-        public void StartAccept(Socket socket)
+        public void StartAccept()
         {
             this.AllocPool();
+            this.m_ClientState = ClientState.TCP_SYNACK;
 
-            if(!socket.ReceiveAsync(this.eArgs[0])) {
-                eLoop(socket, this.eArgs[0]);
-            }
+            m_socket.ReceiveAsync(this.eArgs[0]);
         }
 
+        byte[] recvBuffer;
+        byte[] sendBuffer;
         public void eLoop(object sender, SocketAsyncEventArgs e)
         {
             if(clientUntoten || this.eArgs == null)
@@ -219,12 +228,16 @@ namespace SocksServer
                 return;
             }
 
-            Console.WriteLine("DIAG" + m_ClientState);
-            Console.WriteLine(sender == m_outbound);
-            Console.WriteLine(e.LastOperation);
-            Console.WriteLine(e.BytesTransferred);
-            Console.Write(HexDump(e.Buffer, 16, e.BytesTransferred));
-            Console.WriteLine("DIAGEND");
+            Console.WriteLine("[" + m_index + "] " + "DIAG" + m_ClientState);
+            Console.WriteLine("[" + m_index + "] " + (sender == m_outbound));
+            Console.WriteLine("[" + m_index + "] " + e.LastOperation);
+            Console.WriteLine("[" + m_index + "] " + e.BytesTransferred);
+            if(e.BytesTransferred > 0)
+            {
+                Console.Write(HexDump(e.Buffer, 16, e.BytesTransferred));
+            }
+            Console.WriteLine("[" + m_index + "] " + "DIAGEND");
+
 
             if(m_ClientState == ClientState.TCP_SYNACK && e.LastOperation == SocketAsyncOperation.Receive)
             {
@@ -248,7 +261,7 @@ namespace SocksServer
             }
             else if(m_ClientState == ClientState.Accepted && e.LastOperation == SocketAsyncOperation.Receive)
             {
-                byte[] buffer = l_server.m_bufferManager.TakeBuffer(2);
+                byte[] buffer = m_server.m_bufferManager.TakeBuffer(2);
                 buffer[0] = 5;
 
             /* 
@@ -269,23 +282,27 @@ namespace SocksServer
                     buffer[1] = 0x00;
                     this.eArgs[1].SetBuffer(buffer, 0, 2);
 
-                    if(!this.l_socket.SendAsync(this.eArgs[1]))
+                    if(!this.m_socket.SendAsync(this.eArgs[1]))
                     {
                         eLoop(sender, this.eArgs[1]);
+                        return;
+                    } else {
+                        return;
                     }
+                } else {
+                    Console.WriteLine("No authentication methods found");
+                    return;
                 }
 
-                return;
             }
             else if(m_ClientState == ClientState.Authenticated && e.LastOperation == SocketAsyncOperation.Send)
             {
                 this.m_ClientState = ClientState.ReceivingRequest;
-                if(!this.l_socket.ReceiveAsync(this.eArgs[2]))
+                if(!this.m_socket.ReceiveAsync(this.eArgs[2]))
                 {
                     eLoop(sender, this.eArgs[2]);
+                    return;
                 }
-
-                return;
             }
             /*
             +----+-----+-------+------+----------+----------+
@@ -300,69 +317,117 @@ namespace SocksServer
 
                 if (this.m_ClientState == ClientState.Connecting)
                 {
-                    this.StartProxying(sender);// this.eArgs[3]
+                    bool happy = this.StartProxying(sender);// this.eArgs[3]
+                    sourceOfHappiness.Token.Register(() => {
+                        this.eArgs[4].UserToken = ClientState.RemoteConnected;
+                        this.m_socket.SendAsync(this.eArgs[4]);
+                    });
                 }
             }
-            else if(m_ClientState == ClientState.RemoteConnected_Notify
+            else if(m_ClientState == ClientState.RemoteConnecting_Notify
                     || (m_ClientState == ClientState.RemoteConnecting && e.LastOperation == SocketAsyncOperation.Connect && this.m_outbound == sender))
             {
-                /*
-        +----+-----+-------+------+----------+----------+
-        |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-        +----+-----+-------+------+----------+----------+
-        | 1  |  1  | X'00' |  1   | Variable |    2     |
-        +----+-----+-------+------+----------+----------+
+                /* RFC1928 §6
+                   bytes consumed by SOCKS5 response
+                +----+-----+-------+------+----------+----------+
+                |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+                +----+-----+-------+------+----------+----------+
+                | 1  |  1  | X'00' |  1   | Variable |    2     |
+                +----+-----+-------+------+----------+----------+
                 */
-                Console.WriteLine();
                 SocketAddress address = ((IPEndPoint)m_outbound.LocalEndPoint).Serialize();
                 byte[] buffer, portBytes;
                 portBytes = BitConverter.GetBytes((short)((IPEndPoint)m_outbound.LocalEndPoint).Port);
+                for(int i = 0; i < 2; i++) {
+                    Console.WriteLine(portBytes[i]);
+                }
+                Console.WriteLine();
+                for(int i = 0; i < address.Size; i++) {
+                    Console.WriteLine(address[i]);
+                }
 
                 switch(m_outbound.LocalEndPoint.AddressFamily) {
                     case AddressFamily.InterNetworkV6:
-                        buffer = new byte[22] {0x05, 0, 0, 0x04, address[4], address[5], address[6], address[7], address[8], address[9], address[10], address[11], address[12], address[13], address[14], address[15], address[16], address[17], address[18], address[19], address[20], address[3]};
-                        for (int i = 0; i < 16; i++) {
-                            buffer[22 - 2 - i] = address[i];
-                        }
-                        buffer[22 - 1] = portBytes[1];
-                        buffer[22 - 2] = portBytes[0];
+                        buffer = new byte[22] {0x05, 0, 0, 0x04, address[4], address[5], address[6], address[7], address[8], address[9], address[10], address[11], address[12], address[13], address[14], address[15], address[16], address[17], address[18], address[19], address[4], address[3]};
                         this.eArgs[4].SetBuffer(buffer, 0, 22);
                         break;
                     case AddressFamily.InterNetwork:
-                        buffer = new byte[] {0x05, 0, 0, 0x01, address[4], address[5], address[6], address[7], address[4], address[3]};
+                        buffer = new byte[10] {0x05, 0, 0, 0x01, address[4], address[5], address[6], address[7], address[2], address[3]};
                         this.eArgs[4].SetBuffer(buffer, 0, 10);
                         break;
                     default:
                         throw new Exception("Protocol not implemented");
                 }
 
-                if(!this.l_socket.SendAsync(this.eArgs[4]))
-                {
-                    this.m_ClientState = ClientState.RemoteConnected;
-                    eLoop(sender, this.eArgs[4]);
-                    return;
-                }
-
-                Console.WriteLine("Client has connected to " + requestAddress);
+                Console.WriteLine("SOCKS5 response");
+                sourceOfHappiness.Cancel();
+                return;
             }
-
-            if(this.m_ClientState == ClientState.RemoteConnecting)
+            else if(m_socket == sender && (e.UserToken is ClientState && (ClientState)e.UserToken == ClientState.RemoteConnected) && e.LastOperation == SocketAsyncOperation.Send)
             {
+                Console.WriteLine("Test");
                 this.m_ClientState = ClientState.RemoteConnected;
-            }
-
-            if(this.m_ClientState != ClientState.RemoteConnected)
-            {
+                startForwardingTokenDestination.Cancel();
+                SocketAsyncEventArgs args = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                args.Completed += this.m_InboundReceive;    
+                //args.SocketFlags = SocketFlags.Partial;
+                this.m_socket.ReceiveAsync(args);
                 return;
             }
 
-            if((this.eArgs[6].SocketError != SocketError.Success && sender == m_outbound) || (m_outbound != null && !m_outbound.Connected))
+            startForwarding:
+
+            if(this.m_ClientState != ClientState.RemoteConnected)
+            {
+                Console.WriteLine("Dropped out of connecting loop");
+                return;
+            }
+
+            if(!CheckAlive(sender, e))
+            {
+                Console.WriteLine("ActiveClient Dead");
+                return;
+            }
+
+            Console.WriteLine("Connect loop: 3");
+
+            if(m_ClientState == ClientState.RemoteConnected && e.SocketError == SocketError.Success)
+            {
+                Console.WriteLine("SOCKFLAGS:" + e.SocketFlags);
+                Console.WriteLine("SOCKETERROR: " + e.SocketError);
+
+                if((sender == m_socket) && e.LastOperation == SocketAsyncOperation.Send && e.UserToken == null) {
+                    SocketAsyncEventArgs args = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                    args.Completed += this.m_OutboundReceive;
+                    //args.SocketFlags = SocketFlags.Partial;
+
+                    if(!this.m_outbound.ReceiveAsync(args))
+                        Console.WriteLine("Help");
+                    return;
+                } else if((sender == m_outbound) && e.LastOperation == SocketAsyncOperation.Send && e.UserToken == null) {
+                    SocketAsyncEventArgs args = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                    args.Completed += this.m_InboundReceive;
+                    //args.SocketFlags = SocketFlags.Partial;
+                    // args.RemoteEndPoint = this.m_socket.RemoteEndPoint;
+
+                    if(!this.m_socket.ReceiveAsync(args))
+                        Console.WriteLine("Test");
+                    return;
+                }
+            }
+        }
+
+        public bool CheckAlive(object sender, SocketAsyncEventArgs e)
+        {
+            Console.WriteLine("Connect loop: 0");
+            bool clientUntoten = false;
+            if((e.SocketError != SocketError.Success && sender == m_outbound) || (m_outbound != null && !m_outbound.Connected))
             {
                 try
                 {
                     Console.WriteLine("Error on outbound socket " + e.SocketError);
                     this.eArgs = null;
-                    l_socket.Close(0);
+                    m_socket.Close(0);
                     m_outbound.Close(0);
                 }
                 catch (SocketException ex)
@@ -377,17 +442,19 @@ namespace SocksServer
                 {
                     clientUntoten = true;
                 }
-                return;
+                return false;
             }
 
-            if((this.eArgs[5].SocketError != SocketError.Success && sender == l_socket) || !l_socket.Connected)
+            Console.WriteLine("Connect loop: 1");
+
+            if((e.SocketError != SocketError.Success && sender == m_socket) || !m_socket.Connected)
             {
                 try
                 {
                     Console.WriteLine("Error on inbound socket " + e.SocketError);
                     this.eArgs = null;
                     m_outbound.Close(0);
-                    l_socket.Close(0);
+                    m_socket.Close(0);
                 }
                 catch (SocketException ex)
                 {
@@ -401,78 +468,140 @@ namespace SocksServer
                 {
                     clientUntoten = true;
                 }
-                return;
+                return false;
             }
 
-            if(clientUntoten || this.eArgs == null)
-            {
-                return;
-            }
 
-            if(!this.l_socket.SendAsync(this.eArgs[4]))
-            {
-                eLoop(sender, e);
-                return;
-            } else {
-                this.m_ClientState = ClientState.RemoteConnected;
-            }
+            Console.WriteLine("Connect loop: 2");
 
-            if(!this.l_socket.SendAsync(this.eArgs[4]))
-            {
-                eLoop(sender, e);
-                return;
-            } else {
-                this.m_ClientState = ClientState.RemoteConnected;
-            }
+            return clientUntoten || this.eArgs == null;
+        }
 
-            if(m_ClientState == ClientState.RemoteConnected && e.SocketError == SocketError.Success)
-            {
-                if((sender == m_outbound) && e.LastOperation == SocketAsyncOperation.Receive) {
-                    if(e.BytesTransferred > 0) {
-                        byte[] buffer = this.l_server.m_bufferManager.TakeBuffer(e.BytesTransferred);
-                        for(int i = 0; i < e.BytesTransferred; i++) {
-                            buffer[i] = e.Buffer[i];
+
+        public void InboundReceive(object sender, SocketAsyncEventArgs e)
+        {
+            if((sender == m_socket) && (e.LastOperation == SocketAsyncOperation.Receive)) {
+            // tryAgainS:
+                if(e.BytesTransferred > 0 && e.Buffer != null) {
+                    Console.WriteLine("A");
+                    int copied = (e.BytesTransferred > BUFFER_SIZE ? BUFFER_SIZE : e.BytesTransferred);
+                    byte[] originBuffer = m_server.m_bufferManager.TakeBuffer(copied);
+                    Buffer.BlockCopy(e.Buffer, 0, originBuffer, 0, copied);
+                    int rcv = Int32.Parse(e.BytesTransferred.ToString());
+                    int offset = Int32.Parse(e.Offset.ToString());
+                    Console.WriteLine("B");
+                    Console.WriteLine(e.Count);
+
+                    if(rcv <= BUFFER_SIZE) this.m_server.m_readWritePool.Return(e);
+                    //this.m_server.m_readWritePool.Return(e);
+                    //this.m_server.m_readWritePool.Return(this.eArgs[10]);
+
+                    if(rcv > BUFFER_SIZE || e.SocketFlags == SocketFlags.Partial) {
+                        Console.WriteLine("C");
+                        bool wasUserTokenNull = e.UserToken == null;
+                        SocketAsyncEventArgs eC = wasUserTokenNull ? this.m_server.m_readWritePool.Take(BUFFER_SIZE) : (SocketAsyncEventArgs) e.UserToken;
+                        if(wasUserTokenNull) eC.Completed += this.Loop;
+
+                        eC.SetBuffer(originBuffer, 0, BUFFER_SIZE);
+                        eC.RemoteEndPoint = m_outbound.RemoteEndPoint;
+                        e.UserToken = eC;
+                        m_outbound.SendAsync(eC);
+
+                        Console.WriteLine("D");
+                        SocketAsyncEventArgs args = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                        args.Completed += this.Loop;
+                        args.UserToken = eC;
+                        //args.SocketFlags = SocketFlags.Partial;
+                        //this.m_server.m_readWritePool.Return(e);
+
+                        //this.eArgs[8] = this.m_server.m_readWritePool.Take();
+                        if(!this.m_socket.ReceiveAsync(args)) {
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            return;
                         }
-                        this.l_server.m_bufferManager.ReturnBuffer(this.eArgs[8].Buffer);
-                        this.eArgs[8].SetBuffer(buffer, 0, e.BytesTransferred);
+                        // goto tryAgainS;
+                    } else {
+                        Console.WriteLine("E");
+                        bool wasUserTokenNull = (e.UserToken == null || !(e.UserToken is SocketAsyncEventArgs));
+                        SocketAsyncEventArgs eC = wasUserTokenNull ? this.m_server.m_readWritePool.Take(copied) : (SocketAsyncEventArgs) e.UserToken;
+                        Console.WriteLine("F");
+                        eC.SetBuffer(originBuffer, 0, copied);
+                        Console.WriteLine("G");
+                        //this.eArgs[8] = this.m_server.m_readWritePool.Take();
+                        eC.UserToken = null;
+                        if(wasUserTokenNull) eC.Completed += this.Loop;
+                        //eC.SocketFlags = e.UserToken == null ? SocketFlags.None : SocketFlags.Truncated;
+                        m_outbound.SendAsync(eC);
+                        Console.WriteLine("H");
+                        //this.m_server.m_readWritePool.Return(e);
                     }
-                    // this.eArgs[8].RemoteEndPoint = e.RemoteEndPoint;
-
-                    if(!this.l_socket.SendAsync(e))
-                        eLoop(l_socket, e);
-                    return;
-                } else if((sender == l_socket) && e.LastOperation == SocketAsyncOperation.Send) {
-                    byte[] buf = this.eArgs[9].Buffer;
-                    this.eArgs[9].SetBuffer(this.l_server.m_bufferManager.TakeBuffer(BUFFER_SIZE), 0, BUFFER_SIZE);
-                    this.l_server.m_bufferManager.ReturnBuffer(buf);
-                    // this.eArgs[9].LocalEndPoint = l_socket.RemoteEndPoint;
-
-                    if(!this.m_outbound.ReceiveAsync(this.eArgs[9]))
-                        eLoop(m_outbound, this.eArgs[9]);
-                    return;
-                } else if((sender == l_socket) && e.LastOperation == SocketAsyncOperation.Receive) {
-                    if(e.BytesTransferred > 0) {
-                        byte[] buffer = this.l_server.m_bufferManager.TakeBuffer(e.BytesTransferred);
-                        for(int i = 0; i < e.BytesTransferred; i++) {
-                            buffer[i] = e.Buffer[i];
-                        }
-                        this.l_server.m_bufferManager.ReturnBuffer(this.eArgs[7].Buffer);
-                        this.eArgs[7].SetBuffer(buffer, 0, e.BytesTransferred);
-                    }
-                    // this.eArgs[7].RemoteEndPoint = e.RemoteEndPoint;
-
-                    if(!this.m_outbound.SendAsync(e))
-                        eLoop(m_outbound, e);
-                    return;
-                } else if((sender == m_outbound) && e.LastOperation == SocketAsyncOperation.Send) {
-                    byte[] buf = this.eArgs[10].Buffer;
-                    this.eArgs[10].SetBuffer(this.l_server.m_bufferManager.TakeBuffer(BUFFER_SIZE), 0, BUFFER_SIZE);
-                    this.l_server.m_bufferManager.ReturnBuffer(buf);    
-
-                    if(!this.l_socket.ReceiveAsync(this.eArgs[10]))
-                        eLoop(l_socket, this.eArgs[10]);
-                    return;
                 }
+                Console.WriteLine("inbound receive finished");
+
+                return;
+            } 
+        }
+
+        public void OutboundReceive(object sender, SocketAsyncEventArgs e)
+        {
+            if((sender == m_outbound) && (e.LastOperation == SocketAsyncOperation.Receive))
+            {
+                tryAgain:
+                if(e.BytesTransferred > 0 && e.Buffer != null) {
+                    Console.WriteLine("outbound receive");
+                    int copied = (e.BytesTransferred > BUFFER_SIZE ? BUFFER_SIZE : e.BytesTransferred);
+                    Console.WriteLine("copied: " + copied.ToString());
+                    byte[] originBuffer = m_server.m_bufferManager.TakeBuffer(copied);
+                    Buffer.BlockCopy(e.Buffer, 0, originBuffer, 0, copied);
+                    int rcv = Int32.Parse(e.BytesTransferred.ToString());
+                    int offset = Int32.Parse(e.Offset.ToString());
+                    Console.WriteLine("rcv: " + rcv.ToString());
+                    Console.WriteLine("offset: " + offset.ToString());
+                    if(rcv <= BUFFER_SIZE) this.m_server.m_readWritePool.Return(e);
+
+                    //this.m_server.m_readWritePool.Return(e);
+                    //this.m_server.m_readWritePool.Return(this.eArgs[10]);
+
+                    if(rcv > BUFFER_SIZE || e.SocketFlags == SocketFlags.Truncated) {
+                        Console.WriteLine("buffer_size < rcv");
+                        bool wasUserTokenNull = e.UserToken == null;
+                        SocketAsyncEventArgs eC = wasUserTokenNull ? this.m_server.m_readWritePool.Take(BUFFER_SIZE) : (SocketAsyncEventArgs) e.UserToken;
+                        if(wasUserTokenNull) eC.Completed += this.Loop;
+
+                        eC.SetBuffer(originBuffer, 0, BUFFER_SIZE);
+                        eC.RemoteEndPoint = m_socket.RemoteEndPoint;
+                        m_socket.SendAsync(eC);
+
+                        SocketAsyncEventArgs args = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                        args.Completed += this.Loop;
+                        args.UserToken = eC;
+                        //args.SocketFlags = SocketFlags.Partial;
+                        //this.m_server.m_readWritePool.Return(e);
+
+                        //this.eArgs[8] = this.m_server.m_readWritePool.Take();
+                        if(!this.m_outbound.ReceiveAsync(args)) {
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            Console.WriteLine("RECEIVE CANCELLED?");
+                            return;
+                        }
+                        // goto tryAgain;
+                    } else {
+                        bool wasUserTokenNull = (e.UserToken == null || !(e.UserToken is SocketAsyncEventArgs));
+                        SocketAsyncEventArgs eC = wasUserTokenNull ? this.m_server.m_readWritePool.Take(copied) : (SocketAsyncEventArgs) e.UserToken;
+                        eC.SetBuffer(originBuffer, 0, copied);
+                        eC.UserToken = null;
+                        if(wasUserTokenNull) eC.Completed += this.Loop;
+                        //eC.SocketFlags = SocketFlags.Truncated;
+                        //this.eArgs[8] = this.m_server.m_readWritePool.Take();
+                        m_socket.SendAsync(eC);
+                        //this.m_server.m_readWritePool.Return(e);
+                    }
+                }
+
+                Console.WriteLine("outbound receive finished ");
             }
         }
 
@@ -529,7 +658,7 @@ namespace SocksServer
             {
                 try
                 {
-                    l_socket.Close(0);
+                    m_socket.Close(0);
                 }
                 catch (SocketException ex)
                 {
@@ -689,7 +818,9 @@ namespace SocksServer
             {
                 try
                 {
-                    l_socket.Close(0);
+
+                    Console.WriteLine("Couldn't process request further, disconnecting socket");
+                    m_socket.Close(0);
                 }
                 catch (SocketException ex)
                 {
@@ -706,7 +837,7 @@ namespace SocksServer
             }
         }
 
-        public void StartProxying(object sender)
+        public bool StartProxying(object sender)
         {
             Console.WriteLine("EndpointGet");
 
@@ -722,20 +853,40 @@ namespace SocksServer
             this.m_outbound = new Socket(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
 
           //  listenSocket = new Socket(localEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            CancellationTokenSource timeout = new CancellationTokenSource();
-            timeout.CancelAfter(1000);
-            CancellationToken token = timeout.Token;
 
-            token.Register(() =>
+            System.Threading.Tasks.Task task = System.Threading.Tasks.Task.Run(() =>
             {
+                startForwardingTokenDestination = new CancellationTokenSource();
+                startForwardingTokenDestination.CancelAfter(60 * 60 * 1000);
+                CancellationToken tokenDst = startForwardingTokenDestination.Token;
+                tokenDst.Register(() => {
+                    SocketAsyncEventArgs e = this.m_server.m_readWritePool.Take(BUFFER_SIZE);
+                    e.Completed += this.m_OutboundReceive;
+                    //e.SocketFlags = SocketFlags.Partial;
+                    this.m_outbound.ReceiveAsync(e);
+                });
+
+                this.m_ClientState = ClientState.RemoteConnecting;
                 if(!this.m_outbound.ConnectAsync(remoteConnect)) {
-                    this.m_ClientState = ClientState.RemoteConnected_Notify;
-                    eLoop(sender, remoteConnect);
-                } else {
-                    this.m_ClientState = ClientState.RemoteConnecting;
+                    this.m_ClientState = ClientState.RemoteConnecting_Notify;
+                    eLoop(this.m_outbound, remoteConnect);
+
+                    // if(this.m_ClientState == ClientState.RemoteConnected) {
+                    //     if(!this.m_outbound.ReceiveAsync(this.eArgs[8])) {
+                    //         eLoop(this.m_outbound, this.eArgs[8]);
+                    //         return;
+                    //     }
+                    // }
                 }
             });
 
+            sourceOfHappiness = new CancellationTokenSource();
+            sourceOfHappiness.CancelAfter(60 * 60 * 1000);
+
+
+            //task.Wait(1000);
+            return true;
+            //task.Wait();
             //this.l_readOutbound.UserToken = m_outbound;
 
             //m_outbound.

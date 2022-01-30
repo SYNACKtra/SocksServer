@@ -614,6 +614,19 @@ namespace MS {
                 return this.objectQueue.Dequeue();
             }
         }
+
+        public SocketAsyncEventArgs Take(int bufferSize)
+        {
+            start:
+            SocketAsyncEventArgs t = this.Take();
+            try {
+                t.SetBuffer(this.m_bufferManager.TakeBuffer(bufferSize), 0, bufferSize);
+            } catch {
+                this.Return(t);
+                goto start;
+            }
+            return t;
+        }
  
         public void Close()
         {
@@ -687,7 +700,7 @@ namespace MS {
         public SocketAsyncEventArgs Create()
         {
             SocketAsyncEventArgs eventArgs = new SocketAsyncEventArgs();
-            eventArgs.SetBuffer(this.m_bufferManager.TakeBuffer(acceptBufferSize), 0, acceptBufferSize);
+            //eventArgs.SetBuffer(this.m_bufferManager.TakeBuffer(acceptBufferSize), 0, acceptBufferSize);
             return eventArgs;    
         }
     }

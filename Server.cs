@@ -9,6 +9,7 @@ namespace SocksServer
 {
     public struct Client {
         public ActiveClient ConnectedClient { get; set; }
+        public bool SkipToConnect { get; set; }
     }
 
     // Implements the connection logic for the socket server.
@@ -27,7 +28,7 @@ namespace SocksServer
         public QueuedSocketAsyncEventArgsPool m_readWritePool;
         public QueuedSocketAsyncEventArgsPool m_acceptPool;
         public EventHandler<SocketAsyncEventArgs> m_CompletedIO;
-        public static int SOCK_ARGS_COUNT = 40;
+        public static int SOCK_ARGS_COUNT = 50000;
         public Client?[] m_acceptedConnections;
         int m_totalBytesRead;           // counter of the total # bytes received by the server
         int m_numConnectedSockets;      // the total number of clients connected to the server
@@ -51,6 +52,7 @@ namespace SocksServer
             //write posted to the socket simultaneously
             m_bufferManager = BufferManager.CreateBufferManager(numConnections * 10 * receiveBufferSize, receiveBufferSize);
             m_acceptPool = new QueuedSocketAsyncEventArgsPool(numConnections, m_bufferManager);
+            m_readWritePool = new QueuedSocketAsyncEventArgsPool(numConnections * SOCK_ARGS_COUNT, m_bufferManager);
             m_maxNumberAcceptedClients = new Semaphore(numConnections, numConnections);
             m_CompletedIO = new EventHandler<SocketAsyncEventArgs>(IO_Completed);
         }
@@ -72,8 +74,8 @@ namespace SocksServer
             for (int i = 0; i < m_numConnections; i++)
             {
                 //Pre-allocate a set of reusable SocketAsyncEventArgs
-                eventArgs = new SocketAsyncEventArgs();
-                eventArgs.UserToken = new Client();
+                eventArgs = m_acceptPool.Take();
+                eventArgs.UserToken = null;
                 eventArgs.Completed += m_CompletedIO;
                 m_acceptPool.Return(eventArgs);
             }
@@ -93,7 +95,7 @@ namespace SocksServer
             listenSocket.Listen(100);
 
             // post accepts on the listening socket
-            StartAccept(null);
+            StartAccept();
 
             //Console.WriteLine("{0} connected sockets with one outstanding receive posted to each....press any key", m_outstandingReadCount);
             Console.WriteLine("Press any key to terminate the server process....");
@@ -104,37 +106,28 @@ namespace SocksServer
         //
         // <param name="acceptEventArg">The context object to use when issuing
         // the accept operation on the server's listening socket</param>
-        public void StartAccept(SocketAsyncEventArgs acceptEventArg)
+        public void StartAccept()
         {
             Console.WriteLine("Starting to listen");
-        listen:
-            if (acceptEventArg == null)
-            {
-                acceptEventArg = this.m_acceptPool.Take();
-            }
-            else
-            {
-                // socket must be cleared since the context object is being reused
-                acceptEventArg.AcceptSocket = null;
-                acceptEventArg.UserToken = null;
-            }
 
-            m_maxNumberAcceptedClients.WaitOne();
-            Console.WriteLine("LISTENING: accepting a connection");
-
-            bool willRaiseEvent = listenSocket.AcceptAsync(acceptEventArg);
+            //m_maxNumberAcceptedClients.WaitOne();
+            //Console.WriteLine("LISTENING: accepting a connection");
+        startAccepting:
+            Socket s = listenSocket.Accept();
 
             // c.Initialize(acceptEventArg);
 
-            if (!willRaiseEvent)
+            if (s != null)
             {
-                // task run TODO
-                StartAccept(acceptEventArg);
-                //goto listen;
+                Console.WriteLine("Socket accepted");
+                ActiveClient l_connectedClient = new ActiveClient(this);
+                l_connectedClient.SetSocket(s);
+                l_connectedClient.StartAccept();
+                goto startAccepting;    
             }
             else
             {
-                Console.WriteLine("ACCEPTING: event fired");
+                Console.WriteLine("ACCEPTING: event not fired");
             }
         }
 
@@ -163,13 +156,15 @@ namespace SocksServer
         {
             Client token;
 
-            if(e.UserToken is Client) {
+            if(e.UserToken != null && e.UserToken is Client) {
                 token = (Client) e.UserToken;
-                if (token.ConnectedClient == null) {
-                    token.ConnectedClient = new ActiveClient(this);
-                }
             } else {
                 token = new Client();
+                e.UserToken = (object) token;
+            }
+
+            if (token.ConnectedClient == null) {
+                token.ConnectedClient = new ActiveClient(this);
             }
 
             Console.WriteLine("OP:" + e.LastOperation);
@@ -182,8 +177,6 @@ namespace SocksServer
                 case SocketAsyncOperation.Accept:
                     if(sender is Socket) {
                         Interlocked.Increment(ref m_numConnectedSockets);
-                        token.ConnectedClient.Initialize(e);
-                        token.ConnectedClient.StartAccept(e.AcceptSocket);
                     }
 
                     break;  

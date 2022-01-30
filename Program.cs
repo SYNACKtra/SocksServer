@@ -40,7 +40,7 @@ namespace SocksServer
             Thread.Sleep(29);
             Console.WriteLine(new avg(2^5, 0));
 
-            Server server = new Server (100, 512);
+            Server server = new Server (100, 1024);
             server.Init();
             server.Start(CreateIPEndPoint());
         }
